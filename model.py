@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import einops
 
-from transformer import DecoderLayer
+from transformer import TransformerDecoder
 
 
 img_size = 640
@@ -74,50 +74,63 @@ class MLP(nn.Module):
 class MaskFormer(nn.Module):
     """
     "We obtain each binary mask prediction mi 2 [0; 1]H W via a dot product between the ith mask embedding and per-pixel embeddings Epixel computed by the pixel-level module. The dot product is followed by a sigmoid activation, i.e., mi[h;w] = sigmoid(Emask[:; i]T   Epixel[:; h;w]).
-    "It is beneficial to not enforce mask predictions to be mutually exclusive to each other by using a softmax activation."
-    "For simplicity we use the same Lmask as DETR [4], i.e., a linear combination of a focal loss [27] and a dice loss [33] multiplied by hyper-parameters  focal and  dice respectively."
+    "It is beneficial to not enforce mask predictions to be mutually exclusive
+    to each other by using a softmax activation."
+    "For simplicity we use the same $\mathcal{L}_{text{mask}}$ as DETR, i.e.,
+    a linear combination of a focal loss and a dice loss multiplied by
+    hyper-parameters $\lambda_{text{focal}}$ and $\lambda_{text{dice}}$
+    respectively."
     """
+    def __init__(
+        self,
+        num_classes=80,
+        num_qs=40,
+        q_dim=384,
+        embed_dim=128,
+        n_heads=1,
+        n_layers=1,
+    ):
+        super().__init__()
+
+        self.num_qs = num_qs
+        self.q_dim = q_dim
+
+        self.backbone = Backbone(feat_dim=q_dim)
+        self.pixel_decoder = PixelDecoder()
+        self.decoder = TransformerDecoder(
+            n_heads=n_heads, dim=q_dim, mlp_dim=q_dim * 4, n_layers=n_layers,
+        )
+        self.mlp = MLP(
+            q_dim=q_dim,
+            embed_dim=embed_dim,
+            mlp_dim = embed_dim * 4,
+            num_classes=num_classes,
+        )
+
+    def forward(self, image):
+        img_feat = self.backbone(image) # "$\mathcal{F}$"
+        img_feat = einops.rearrange(img_feat, pattern="b c h w -> b (h w) c")
+        q = torch.randn((batch_size, self.num_qs, self.q_dim))
+        x = self.decoder(x=q, enc_out=img_feat)
+        cls_prob, pred_bbox = self.mlp(x)
+        x = self.pixel_decoder(img_feat)
+        x = torch.einsum("bchw,bnc->bnhw", x, pred_bbox)
+        return cls_prob, x
+
     def get_loss(self):
-        pass
-    """
-    "Unlike DETR that uses bounding boxes to compute the assignment costs between prediction zi and ground truth zgt j for the matching problem, we directly use class and mask predictions, i.e., 􀀀pi(cgt j ) + Lmask(mi;mgt j ), where Lmask is a binary mask loss."
-    "The main mask classification loss Lmask-cls is composed of a cross-entropy classification loss and a binary mask loss Lmask for each predicted segment: Lmask-cls(z; zgt) = XN j=1 h 􀀀log p (j)(cgt j ) + 1 cgt j 6=?Lmask(m (j);mgt j ) i :
-    """
+        """
+        "Unlike DETR that uses bounding boxes to compute the assignment costs between prediction zi and ground truth zgt j for the matching problem, we directly use class and mask predictions, i.e., 􀀀pi(cgt j ) + Lmask(mi;mgt j ), where Lmask is a binary mask loss."
+        "The main mask classification loss Lmask-cls is composed of a cross-entropy classification loss and a binary mask loss Lmask for each predicted segment: Lmask-cls(z; zgt) = XN j=1 h 􀀀log p (j)(cgt j ) + 1 cgt j 6=?Lmask(m (j);mgt j ) i :
+        """
+        # num_gts = 13
+        # gt_label = torch.randint(
+        #     0, num_classes + 1, size=(num_gts,), dtype=torch.long,
+        # )
 
 
 if __name__ == "__main__":
-    num_classes = 80
-    num_gts = 13
-    gt_label = torch.randint(0, num_classes + 1, size=(num_gts,), dtype=torch.long)
-    num_qs = 40
-    q_dim = 384
-    embed_dim = 128
-    backbone = Backbone(feat_dim=q_dim)
-    pixel_decoder = PixelDecoder()
+    model = MaskFormer()
     batch_size = 4
-    x = torch.randn(size=(batch_size, 3, img_size, img_size))
-    backbone_out = backbone(x)
-    backbone_out = einops.rearrange(
-        backbone_out, pattern="b c h w -> b (h w) c",
-    )
-
-    n_heads = 1
-    dim = q_dim
-    mlp_dim = 4 * dim
-    dec_layer = DecoderLayer(
-        n_heads=n_heads, dim=dim, mlp_dim=mlp_dim,
-    )
-    q = torch.randn((batch_size, num_qs, q_dim))
-    x = dec_layer(x=q, enc_out=backbone_out)
-    mlp = MLP(
-        q_dim=q_dim,
-        embed_dim=embed_dim,
-        mlp_dim = embed_dim * 4,
-        num_classes=num_classes,
-    )
-    cls_prob, pred_bbox = mlp(x)
-    cls_prob.shape, pred_bbox.shape
-    
-    x = pixel_decoder(backbone_out)
-    x = torch.einsum("bchw,bnc->bnhw", x, pred_bbox)
-    x.shape
+    image = torch.randn(size=(batch_size, 3, img_size, img_size))
+    pred_label, pred_bbox = model(image)
+    pred_label.shape, pred_bbox.shape
