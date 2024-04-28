@@ -5,135 +5,117 @@ import einops
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, n_heads, drop_prob):
+    def __init__(self, width, num_heads, drop_prob):
         super().__init__()
     
-        self.dim = dim # "$d_{model}$"
-        self.n_heads = n_heads # "$h$"
+        self.num_heads = num_heads
 
-        self.head_dim = dim // n_heads # "$d_{k}$, $d_{v}$"
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, width, bias=False)
+        self.v_proj = nn.Linear(width, width, bias=False)
+        self.to_multi_heads = Rearrange("b i (n h) -> b i n h", n=num_heads)
+        self.scale = width ** (-0.5)
+        self.attn_drop = nn.Dropout(drop_prob)
+        self.to_one_head = Rearrange("b i n h -> b i (n h)")
+        self.out_proj = nn.Linear(width, width, bias=False)
 
-        self.q_proj = nn.Linear(dim, dim, bias=False) # "$W^{Q}_{i}$"
-        self.k_proj = nn.Linear(dim, dim, bias=False) # "$W^{K}_{i}$"
-        self.v_proj = nn.Linear(dim, dim, bias=False) # "$W^{V}_{i}$"
-
-        self.attn_drop = nn.Dropout(drop_prob) # Not in the paper
-        self.out_proj = nn.Linear(dim, dim, bias=False) # "$W^{O}$"
-
-    @staticmethod
-    def _get_attention_score(q, k):
-        attn_score = torch.einsum("bnid,bnjd->bnij", q, k)
-        return attn_score
-
-    def forward(self, q, k, v, mask=None):
-        b, i, _ = q.shape
-        _, j, _ = k.shape
-
+    def forward(self, q, k, v):
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
-
-        q = q.view(b, self.n_heads, i, self.head_dim)
-        k = k.view(b, self.n_heads, j, self.head_dim)
-        v = v.view(b, self.n_heads, j, self.head_dim)
-
-        attn_score = self._get_attention_score(q=q, k=k)
-        if mask is not None:
-            mask = einops.repeat(
-                mask, pattern="b i j -> b n i j", n=self.n_heads,
+        attn_score = torch.einsum(
+            "binh,bjnh->bnij", self.to_multi_heads(q), self.to_multi_heads(k),
+        ) * self.scale
+        attn_weight = F.softmax(attn_score, dim=-1)
+        x = self.to_one_head(
+            torch.einsum(
+                "bnij,bjnh->binh",
+                self.attn_drop(attn_weight),
+                self.to_multi_heads(v),
             )
-            attn_score.masked_fill_(mask=mask, value=-1e9) # "Mask (opt.)"
-        attn_score /= (self.head_dim ** 0.5) # "Scale"
-        attn_weight = F.softmax(attn_score, dim=3) # "Softmax"
-
-        attn_weight_drop = self.attn_drop(attn_weight) # Not in the paper
-        x = torch.einsum("bnij,bnjd->bnid", attn_weight_drop, v) # "MatMul"
-        x = einops.rearrange(x, pattern="b n i d -> b i (n d)")
-
+        )
         x = self.out_proj(x)
         return x, attn_weight
 
 
-class PositionwiseFeedForward(nn.Module):
-    def __init__(self, dim, mlp_dim, drop_prob, activ="relu"):
+class FFN(nn.Module):
+    def __init__(self, width, mlp_width, drop_prob):
         super().__init__()
 
-        assert activ in ["relu", "gelu"], (
-            """The argument `activ` must be one of (`"relu"`, `"gelu"`)"""
+        self.layers = nn.Sequential(
+            nn.Linear(width, mlp_width),
+            nn.ReLU(),
+            nn.Dropout(drop_prob),
+            nn.Linear(mlp_width, width),
         )
 
-        self.activ = activ
-
-        self.proj1 = nn.Linear(dim, mlp_dim) # "$W_{1}$"
-        if activ == "relu":
-            self.relu = nn.ReLU()
-        else:
-            self.gelu = nn.GELU()
-        self.proj2 = nn.Linear(mlp_dim, dim) # "$W_{2}$"
-        self.mlp_drop = nn.Dropout(drop_prob)
-
     def forward(self, x):
-        x = self.proj1(x)
-        if self.activ == "relu":
-            x = self.relu(x)
-        else:
-            x = self.gelu(x)
-        x = self.proj2(x)
-        x = self.mlp_drop(x) # Not in the paper
-        return x
+        return self.layers(x)
 
 
 class ResidualConnection(nn.Module):
-    def __init__(self, dim, drop_prob):
+    def __init__(self, fn, width, drop_prob):
         super().__init__()
 
-        self.resid_drop = nn.Dropout(drop_prob) # "Residual dropout"
-        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+        self.res_drop = nn.Dropout(drop_prob)
+        self.norm = nn.LayerNorm(width)
 
-    def forward(self, x, sublayer):
-        skip = x.clone()
-        x = sublayer(x)
-        x = self.resid_drop(x)
-        x += skip # "Add"
-        x = self.norm(x) # "& Norm"
+    def forward(self, skip, **kwargs):
+        x = self.fn(**kwargs)
+        x = self.res_drop(x)
+        x += skip
+        x = self.norm(x)
         return x
 
 
 class DecoderLayer(nn.Module):
     def __init__(
         self,
-        n_heads,
-        dim,
-        mlp_dim,
-        attn_drop_prob=0.1,
-        ff_drop_prob=0.1,
-        resid_drop_prob=0.1,
+        num_heads,
+        width,
+        mlp_width,
+        drop_prob,
     ):
         super().__init__()
 
-        self.n_heads = n_heads
-        self.dim = dim
-        self.mlp_dim = mlp_dim
+        self.self_attn = MultiHeadAttention(
+            width=width, num_heads=num_heads, drop_prob=drop_prob,
+        )
+        self.enc_dec_attn = MultiHeadAttention(
+            width=width, num_heads=num_heads, drop_prob=drop_prob,
+        )
+        self.ffn = FFN(
+            width=width,
+            mlp_width=mlp_width,
+            drop_prob=drop_prob,
+        )
 
-        self.self_attn = MultiHeadAttention(dim=dim, n_heads=n_heads, drop_prob=attn_drop_prob)
-        self.self_attn_resid_conn = ResidualConnection(dim=dim, drop_prob=resid_drop_prob)
-        self.enc_dec_attn = MultiHeadAttention(dim=dim, n_heads=n_heads, drop_prob=attn_drop_prob)
-        self.enc_dec_attn_resid_conn = ResidualConnection(dim=dim, drop_prob=resid_drop_prob)
-        self.feed_forward = PositionwiseFeedForward(
-            dim=dim, mlp_dim=mlp_dim, drop_prob=ff_drop_prob, activ="relu",
+        self.self_attn_res_conn = ResidualConnection(
+            fn=lambda x, out_pos_enc: self.self_attn(
+                q=x + out_pos_enc, k=x + out_pos_enc, v=x)[0],
+            width=width,
+            drop_prob=drop_prob,
         )
-        self.ff_resid_conn = ResidualConnection(dim=dim, drop_prob=resid_drop_prob)
+        self.enc_dec_attn_res_conn = ResidualConnection(
+            fn=lambda x, enc_mem, out_pos_enc: self.enc_dec_attn(
+                q=x + out_pos_enc, k=self.spatial_pos_enc(enc_mem), v=enc_mem,
+            )[0],
+            width=width,
+            drop_prob=drop_prob,
+        )
+        self.ffn_res_conn = ResidualConnection(
+            fn=self.ffn, width=width, drop_prob=drop_prob,
+        )
 
-    def forward(self, x, enc_out):
-        x = self.self_attn_resid_conn(
-            x=x,
-            sublayer=lambda x: self.self_attn(q=x, k=x, v=x)[0],
+    def forward(self, query, enc_mem, out_pos_enc):
+        x = self.self_attn_res_conn(
+            skip=query, x=query, out_pos_enc=out_pos_enc,
         )
-        x = self.enc_dec_attn_resid_conn(
-            x=x,
-            sublayer=lambda x: self.enc_dec_attn(q=x, k=enc_out, v=enc_out)[0]
+        x = self.enc_dec_attn_res_conn(
+            skip=x, x=x, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
         )
-        x = self.ff_resid_conn(x=x, sublayer=self.feed_forward)
+        x = self.ffn_res_conn(skip=x, x=x)
         return x
 
 
@@ -143,35 +125,31 @@ class TransformerDecoder(nn.Module):
     """
     def __init__(
         self,
-        n_heads,
-        dim,
-        mlp_dim,
-        n_layers,
-        attn_drop_prob=0.1,
-        ff_drop_prob=0.1,
-        resid_drop_prob=0.1,
+        num_heads,
+        width,
+        num_layers,
+        drop_prob,
+        mlp_width=None,
     ):
         super().__init__()
 
-        self.n_heads = n_heads
-        self.dim = dim
-        self.n_layers = n_layers
+        self.mlp_width = mlp_width if mlp_width is not None else width * 4
 
         self.dec_stack = nn.ModuleList(
             [
                 DecoderLayer(
-                    n_heads=n_heads,
-                    dim=dim,
-                    mlp_dim=mlp_dim,
-                    attn_drop_prob=attn_drop_prob,
-                    ff_drop_prob=ff_drop_prob,
-                    resid_drop_prob=resid_drop_prob,
+                    num_heads=num_heads,
+                    width=width,
+                    mlp_width=self.mlp_width,
+                    drop_prob=drop_prob,
                 )
-                for _ in range(self.n_layers)
+                for _ in range(num_layers)
             ]
         )
 
-    def forward(self, x, enc_out):
+    def forward(self, query, enc_mem, out_pos_enc):
         for dec_layer in self.dec_stack:
-            x = dec_layer(x, enc_out=enc_out)
-        return x
+            query = dec_layer(
+                query=query, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
+            )
+        return query
